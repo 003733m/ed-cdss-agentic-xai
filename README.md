@@ -15,6 +15,29 @@ The pipeline trains two “pretest” risk models and generates a **single-patie
 
 ---
 
+## Data Source
+
+This project uses publicly available data from the **U.S. National Health and Nutrition Examination Survey (NHANES)**:
+
+**NHANES 2017–2018 Continuous Cycle**  
+CDC Website:  
+https://wwwn.cdc.gov/nchs/nhanes/continuousnhanes/default.aspx?BeginYear=2017
+
+The following NHANES files are used:
+- DEMO (demographics, poverty ratio, age, sex)
+- BPX / BPQ (blood pressure measurements and questionnaire)
+- BMX (anthropometry)
+- SMQ (smoking)
+- MCQ (medical conditions, including heart failure)
+- DIQ (diabetes)
+- ALQ (alcohol)
+- PAQ (physical activity)
+- RXQ_RX (medication records)
+
+These are merged using `DEMO` as the master table via `SEQN` left-joins.
+
+---
+
 ## Repository Structure
 
 ```text
