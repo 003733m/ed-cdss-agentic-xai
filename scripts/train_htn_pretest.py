@@ -9,13 +9,25 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import shap
+import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (
+    roc_auc_score,
+    accuracy_score,
+    f1_score,
+    recall_score,
+    precision_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
 from sklearn.inspection import permutation_importance
 
 from cdss.features import build_feature_groups
 
+# Server environments (like GitHub Actions) often don't have a screen.
+# We use 'Agg' backend to save plots without showing them.
+plt.switch_backend('Agg')
 
 # ----------------------------
 # Helpers
@@ -88,6 +100,7 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
     - Label uses BPX measurements
     - Features exclude BPX & BPQ
     - Uses demographics + anthropometry + questionnaire_lifestyle
+    - 5-Fold Cross Validation for robust metrics
     Saves artifacts in a standard format for paper/demo scripts.
     """
     os.makedirs(artifacts_dir, exist_ok=True)
@@ -137,6 +150,56 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
     pred = model.predict_proba(X_test)[:, 1]
     auc = float(roc_auc_score(y_test, pred))
 
+    # ---------------------------------------------------------
+    # 5-Fold Cross Validation (Robust Metrics)
+    # ---------------------------------------------------------
+    print("⏳ Running 5-Fold Cross Validation...")
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    
+    cv_metrics = {"acc": [], "f1": [], "rec": [], "prec": [], "auc": []}
+    total_cm = np.zeros((2, 2), dtype=int)
+
+    # Note: We run CV on the full X, yv to utilize all data for validation stats
+    for fold_idx, (t_idx, v_idx) in enumerate(skf.split(X, yv)):
+        X_t, X_v = X.iloc[t_idx], X.iloc[v_idx]
+        y_t, y_v_fold = yv.iloc[t_idx], yv.iloc[v_idx]
+
+        # Dynamic SPW
+        pos_n = y_t.sum()
+        neg_n = len(y_t) - pos_n
+        spw_cv = (neg_n / pos_n) if pos_n > 0 else 1.0
+
+        cv_model = xgb.XGBClassifier(
+            n_estimators=400, max_depth=4, learning_rate=0.05,
+            subsample=0.9, colsample_bytree=0.9, scale_pos_weight=spw_cv,
+            eval_metric="logloss", random_state=seed, n_jobs=-1, verbosity=0
+        )
+        cv_model.fit(X_t, y_t)
+        
+        preds_cv = cv_model.predict(X_v)
+        proba_cv = cv_model.predict_proba(X_v)[:, 1]
+
+        cv_metrics["acc"].append(accuracy_score(y_v_fold, preds_cv))
+        cv_metrics["f1"].append(f1_score(y_v_fold, preds_cv))
+        cv_metrics["rec"].append(recall_score(y_v_fold, preds_cv))
+        cv_metrics["prec"].append(precision_score(y_v_fold, preds_cv))
+        cv_metrics["auc"].append(roc_auc_score(y_v_fold, proba_cv))
+        
+        total_cm += confusion_matrix(y_v_fold, preds_cv)
+
+    # Plot & Save Cumulative Confusion Matrix
+    fig, ax = plt.subplots(figsize=(6, 5))
+    disp = ConfusionMatrixDisplay(confusion_matrix=total_cm, display_labels=["No HTN", "HTN"])
+    disp.plot(cmap="Greens", values_format="d", ax=ax)
+    plt.title("Cumulative Confusion Matrix (5-Fold Sum) - HTN")
+    cm_path = os.path.join(artifacts_dir, "htn_confusion_matrix.png")
+    plt.savefig(cm_path)
+    plt.close()
+    print(f"✅ Saved Confusion Matrix to {cm_path}")
+
+    # ---------------------------------------------------------
+    # Feature Importance (Permutation & SHAP)
+    # ---------------------------------------------------------
     # Permutation importance (global)
     perm = permutation_importance(
         model,
@@ -165,8 +228,19 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
     with open(os.path.join(artifacts_dir, "htn_feature_cols.json"), "w", encoding="utf-8") as f:
         json.dump(list(X.columns), f, indent=2)
 
+    # Enhanced Metrics JSON
+    metrics_data = {
+        "auc": auc,
+        "n_samples": int(len(yv)),
+        "n_features": int(X.shape[1]),
+        "cv_mean_auc": float(np.mean(cv_metrics["auc"])),
+        "cv_mean_acc": float(np.mean(cv_metrics["acc"])),
+        "cv_mean_f1": float(np.mean(cv_metrics["f1"])),
+        "cv_mean_recall": float(np.mean(cv_metrics["rec"])),
+        "cv_mean_precision": float(np.mean(cv_metrics["prec"]))
+    }
     with open(os.path.join(artifacts_dir, "htn_metrics.json"), "w", encoding="utf-8") as f:
-        json.dump({"auc": auc, "n_samples": int(len(yv)), "n_features": int(X.shape[1])}, f, indent=2)
+        json.dump(metrics_data, f, indent=2)
 
     meta = {
         "task": "hypertension_by_bp",
@@ -180,6 +254,12 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
         "auc": auc,
         "top_features_perm": perm_top20,
         "top_features_shap": shap_top20,
+        "cv_metrics": {
+            "mean_auc": float(np.mean(cv_metrics["auc"])),
+            "mean_f1": float(np.mean(cv_metrics["f1"])),
+            "mean_recall": float(np.mean(cv_metrics["rec"])),
+            "cumulative_cm": total_cm.tolist()
+        },
         "shap_available": True,
     }
     with open(os.path.join(artifacts_dir, "htn_artifact.json"), "w", encoding="utf-8") as f:
@@ -200,4 +280,5 @@ if __name__ == "__main__":
     df = pd.read_csv(args.csv, low_memory=False)
     meta = train_htn(df, artifacts_dir=args.artifacts_dir, seed=args.seed)
     print("✅ HTN trained | AUC:", meta["auc"])
+    print(f"✅ CV Mean Recall: {meta['cv_metrics']['mean_recall']:.4f}")
     print("✅ Saved artifacts to:", args.artifacts_dir)
