@@ -25,8 +25,7 @@ from sklearn.inspection import permutation_importance
 
 from cdss.features import build_feature_groups
 
-# Server environments (like GitHub Actions) often don't have a screen.
-# We use 'Agg' backend to save plots without showing them.
+# Server environments usually don't have a screen
 plt.switch_backend('Agg')
 
 # ----------------------------
@@ -35,96 +34,68 @@ plt.switch_backend('Agg')
 def _to_num(s):
     return pd.to_numeric(s, errors="coerce")
 
-
-def _mean_cols(df_, cols):
-    cols = [c for c in cols if c in df_.columns]
-    if not cols:
-        return pd.Series(np.nan, index=df_.index)
-    return df_[cols].apply(_to_num).mean(axis=1, skipna=True)
-
-
-def build_hypertension_by_bpx(df_: pd.DataFrame) -> pd.DataFrame:
-    """Label = HTN by BPX measurement means (>=130/80). Also returns stage."""
-    sbp_cols = [c for c in df_.columns if re.match(r"^BPXSY[1-4]$", str(c))]
-    dbp_cols = [c for c in df_.columns if re.match(r"^BPXDI[1-4]$", str(c))]
-
-    sbp_mean = _mean_cols(df_, sbp_cols)
-    dbp_mean = _mean_cols(df_, dbp_cols)
-
-    valid = sbp_mean.notna() | dbp_mean.notna()
-
-    htn = pd.Series(np.nan, index=df_.index, dtype="float")
-    htn.loc[valid] = ((sbp_mean.loc[valid] >= 130) | (dbp_mean.loc[valid] >= 80)).astype(float)
-
-    stage = pd.Series(np.nan, index=df_.index, dtype="float")
-    s2 = (sbp_mean >= 140) | (dbp_mean >= 90)
-    s1 = (((sbp_mean >= 130) & (sbp_mean < 140)) | ((dbp_mean >= 80) & (dbp_mean < 90))) & (~s2)
-    s0 = (~s1) & (~s2) & valid
-
-    stage.loc[s0] = 0.0
-    stage.loc[s1] = 1.0
-    stage.loc[s2] = 2.0
-
-    return pd.DataFrame(
-        {
-            "hypertension_by_bp": htn,
-            "sbp_mean": sbp_mean,
-            "dbp_mean": dbp_mean,
-            "htn_stage": stage,
-        }
-    )
-
-
-def is_bpx_or_bpq(c: str) -> bool:
-    u = str(c).strip().upper()
-    return u.startswith("BPX") or u.startswith("BPQ")
-
-
 def _make_numeric_and_impute(X: pd.DataFrame) -> pd.DataFrame:
     # numeric coerce
     for c in X.columns:
         X[c] = _to_num(X[c])
     # drop all NaN columns
     X = X.dropna(axis=1, how="all")
-    # median impute (simple). For strictest: do train-only median in downstream checks.
+    # median impute
     X = X.apply(lambda col: col.fillna(col.median()) if col.notna().any() else col)
     return X
 
-
 # ----------------------------
-# Train
+# Train HF
 # ----------------------------
-def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42) -> dict:
+def train_hf(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42) -> dict:
     """
-    HTN PRETEST (Leakage-free):
-    - Label uses BPX measurements
-    - Features exclude BPX & BPQ
-    - Uses demographics + anthropometry + questionnaire_lifestyle
-    - 5-Fold Cross Validation for robust metrics
-    Saves artifacts in a standard format for paper/demo scripts.
+    HF PRETEST (Leakage-free):
+    - Label: MCQ160B (Ever told had congestive heart failure)
+    - Features: Excludes MCQ, BPQ, CDQ, RX, BPX (Strict Mode)
+    - Uses: Demographics + Anthropometry + Lifestyle
+    - Includes: 5-Fold CV, Green Confusion Matrix, Detailed Metrics
     """
     os.makedirs(artifacts_dir, exist_ok=True)
 
     feature_groups, survey_vars = build_feature_groups(df)
 
-    # Label
-    htn_df = build_hypertension_by_bpx(df)
-    y = htn_df["hypertension_by_bp"]
-    valid = y.notna()
-    yv = y.loc[valid].astype(int)
-
-    # Leakage-free features (PRETEST)
+    # 1. Label Logic (MCQ160B)
+    label_col = "MCQ160B"
+    if label_col not in df.columns:
+        raise ValueError(f"Label column {label_col} not found in dataframe.")
+    
+    raw = pd.to_numeric(df[label_col], errors="coerce")
+    # NHANES: 1=Yes, 2=No. Others (7,9) are missing/refused.
+    mask = raw.isin([1, 2])
+    
+    # Define y (Target)
+    y_full = (raw[mask] == 1).astype(int)
+    
+    # 2. Leakage-free Features (Strict)
     allowed_groups = ["demographics", "anthropometry", "questionnaire_lifestyle"]
     X_cols = []
     for g in allowed_groups:
         X_cols += (feature_groups.get(g, []) or [])
+    
+    # Remove duplicates and ensure existence
     X_cols = list(dict.fromkeys([c for c in X_cols if c in df.columns]))
-    X_cols = [c for c in X_cols if not is_bpx_or_bpq(c)]
+    
+    # Forbidden Prefixes for HF (Strict Pretest)
+    forbidden_prefixes = ["MCQ", "BPQ", "CDQ", "RX", "BPX"]
+    
+    def is_forbidden(c):
+        u = str(c).strip().upper()
+        return any(u.startswith(p) for p in forbidden_prefixes) or (u == label_col)
 
-    X = df.loc[valid, X_cols].copy()
+    X_cols = [c for c in X_cols if not is_forbidden(c)]
+
+    # 3. Build Modeling Table
+    X = df.loc[mask, X_cols].copy()
+    yv = y_full  # Valid targets
+
     X = _make_numeric_and_impute(X)
 
-    # Split
+    # 4. Main Split (for Final Model & SHAP)
     X_train, X_test, y_train, y_test = train_test_split(
         X, yv, test_size=0.2, stratify=yv, random_state=seed
     )
@@ -133,7 +104,7 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
     neg = int(len(y_train) - pos)
     spw = (neg / pos) if pos > 0 else 1.0
 
-    # Model
+    # Train Main Model
     model = xgb.XGBClassifier(
         n_estimators=400,
         max_depth=4,
@@ -153,18 +124,17 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
     # ---------------------------------------------------------
     # 5-Fold Cross Validation (Robust Metrics)
     # ---------------------------------------------------------
-    print("⏳ Running 5-Fold Cross Validation...")
+    print("⏳ Running 5-Fold Cross Validation (HF)...")
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
     
     cv_metrics = {"acc": [], "f1": [], "rec": [], "prec": [], "auc": []}
     total_cm = np.zeros((2, 2), dtype=int)
 
-    # Note: We run CV on the full X, yv to utilize all data for validation stats
     for fold_idx, (t_idx, v_idx) in enumerate(skf.split(X, yv)):
         X_t, X_v = X.iloc[t_idx], X.iloc[v_idx]
         y_t, y_v_fold = yv.iloc[t_idx], yv.iloc[v_idx]
 
-        # Dynamic SPW
+        # Dynamic SPW per fold
         pos_n = y_t.sum()
         neg_n = len(y_t) - pos_n
         spw_cv = (neg_n / pos_n) if pos_n > 0 else 1.0
@@ -187,28 +157,22 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
         
         total_cm += confusion_matrix(y_v_fold, preds_cv)
 
-    # Plot & Save Cumulative Confusion Matrix
+    # Plot & Save Cumulative Confusion Matrix (Green)
     fig, ax = plt.subplots(figsize=(6, 5))
-    disp = ConfusionMatrixDisplay(confusion_matrix=total_cm, display_labels=["No HTN", "HTN"])
+    disp = ConfusionMatrixDisplay(confusion_matrix=total_cm, display_labels=["No HF", "HF"])
     disp.plot(cmap="Greens", values_format="d", ax=ax)
-    plt.title("Cumulative Confusion Matrix (5-Fold Sum) - HTN")
-    cm_path = os.path.join(artifacts_dir, "htn_confusion_matrix.png")
+    plt.title("Cumulative Confusion Matrix (5-Fold Sum) - HF")
+    cm_path = os.path.join(artifacts_dir, "hf_confusion_matrix.png")
     plt.savefig(cm_path)
     plt.close()
     print(f"✅ Saved Confusion Matrix to {cm_path}")
 
     # ---------------------------------------------------------
-    # Feature Importance (Permutation & SHAP)
+    # Feature Importance
     # ---------------------------------------------------------
-    # Permutation importance (global)
+    # Permutation (Global)
     perm = permutation_importance(
-        model,
-        X_test,
-        y_test,
-        n_repeats=5,
-        random_state=seed,
-        scoring="roc_auc",
-        n_jobs=1,
+        model, X_test, y_test, n_repeats=5, random_state=seed, scoring="roc_auc", n_jobs=1
     )
     perm_imp = pd.Series(perm.importances_mean, index=X_test.columns).sort_values(ascending=False)
     perm_top20 = perm_imp.head(20).index.tolist()
@@ -221,14 +185,14 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
     shap_imp = pd.Series(np.abs(sv_pos).mean(axis=0), index=X_shap.columns).sort_values(ascending=False)
     shap_top20 = shap_imp.head(20).index.tolist()
 
-    # ---- Save artifacts (STANDARD NAMES) ----
-    joblib.dump(model, os.path.join(artifacts_dir, "htn_model.joblib"))
-    joblib.dump(explainer, os.path.join(artifacts_dir, "htn_explainer.joblib"))
+    # ---- Save Artifacts ----
+    joblib.dump(model, os.path.join(artifacts_dir, "hf_model.joblib"))
+    joblib.dump(explainer, os.path.join(artifacts_dir, "hf_explainer.joblib"))
 
-    with open(os.path.join(artifacts_dir, "htn_feature_cols.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(artifacts_dir, "hf_feature_cols.json"), "w", encoding="utf-8") as f:
         json.dump(list(X.columns), f, indent=2)
 
-    # Enhanced Metrics JSON
+    # Detailed Metrics JSON
     metrics_data = {
         "auc": auc,
         "n_samples": int(len(yv)),
@@ -239,15 +203,15 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
         "cv_mean_recall": float(np.mean(cv_metrics["rec"])),
         "cv_mean_precision": float(np.mean(cv_metrics["prec"]))
     }
-    with open(os.path.join(artifacts_dir, "htn_metrics.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(artifacts_dir, "hf_metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics_data, f, indent=2)
 
     meta = {
-        "task": "hypertension_by_bp",
-        "label": "BPX-based (>=130/80)",
+        "task": "heart_failure_by_mcq",
+        "label": "MCQ160B",
         "policy": {
             "allowed_groups": allowed_groups,
-            "forbidden_prefixes": ["BPX", "BPQ"],
+            "forbidden_prefixes": forbidden_prefixes,
             "survey_vars_excluded": survey_vars,
         },
         "feature_cols": list(X.columns),
@@ -262,11 +226,10 @@ def train_htn(df: pd.DataFrame, artifacts_dir: str = "artifacts", seed: int = 42
         },
         "shap_available": True,
     }
-    with open(os.path.join(artifacts_dir, "htn_artifact.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(artifacts_dir, "hf_artifact.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     return meta
-
 
 if __name__ == "__main__":
     import argparse
@@ -278,7 +241,7 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv, low_memory=False)
-    meta = train_htn(df, artifacts_dir=args.artifacts_dir, seed=args.seed)
-    print("✅ HTN trained | AUC:", meta["auc"])
+    meta = train_hf(df, artifacts_dir=args.artifacts_dir, seed=args.seed)
+    print("✅ HF trained | AUC:", meta["auc"])
     print(f"✅ CV Mean Recall: {meta['cv_metrics']['mean_recall']:.4f}")
     print("✅ Saved artifacts to:", args.artifacts_dir)
